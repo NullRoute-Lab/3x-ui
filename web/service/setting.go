@@ -6,19 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mhsanaei/3x-ui/v2/database"
-	"github.com/mhsanaei/3x-ui/v2/database/model"
-	"github.com/mhsanaei/3x-ui/v2/logger"
-	"github.com/mhsanaei/3x-ui/v2/util/common"
-	"github.com/mhsanaei/3x-ui/v2/util/random"
-	"github.com/mhsanaei/3x-ui/v2/util/reflect_util"
-	"github.com/mhsanaei/3x-ui/v2/web/entity"
-	"github.com/mhsanaei/3x-ui/v2/xray"
+	"github.com/mhsanaei/3x-ui/v3/database"
+	"github.com/mhsanaei/3x-ui/v3/database/model"
+	"github.com/mhsanaei/3x-ui/v3/logger"
+	"github.com/mhsanaei/3x-ui/v3/util/common"
+	"github.com/mhsanaei/3x-ui/v3/util/netproxy"
+	"github.com/mhsanaei/3x-ui/v3/util/random"
+	"github.com/mhsanaei/3x-ui/v3/util/reflect_util"
+	"github.com/mhsanaei/3x-ui/v3/web/entity"
+	"github.com/mhsanaei/3x-ui/v3/xray"
 )
 
 //go:embed config.json
@@ -32,8 +34,10 @@ var defaultValueMap = map[string]string{
 	"webCertFile":                 "",
 	"webKeyFile":                  "",
 	"secret":                      random.Seq(32),
+	"apiToken":                    "",
 	"webBasePath":                 "/",
 	"sessionMaxAge":               "360",
+	"trustedProxyCIDRs":           "127.0.0.1/32,::1/128",
 	"pageSize":                    "25",
 	"expireDiff":                  "0",
 	"trafficDiff":                 "0",
@@ -68,6 +72,7 @@ var defaultValueMap = map[string]string{
 	"subUpdates":                  "12",
 	"subEncrypt":                  "true",
 	"subShowInfo":                 "true",
+	"subEmailInRemark":            "true",
 	"subURI":                      "",
 	"subJsonPath":                 "/json/",
 	"subJsonURI":                  "",
@@ -83,7 +88,9 @@ var defaultValueMap = map[string]string{
 	"nord":                        "",
 	"externalTrafficInformEnable": "false",
 	"externalTrafficInformURI":    "",
+	"restartXrayOnClientDisable":  "true",
 	"xrayOutboundTestUrl":         "https://www.google.com/generate_204",
+	"panelProxy":                  "",
 
 	// LDAP defaults
 	"ldapEnable":            "false",
@@ -196,6 +203,35 @@ func (s *SettingService) GetAllSetting() (*entity.AllSetting, error) {
 	return allSetting, nil
 }
 
+func (s *SettingService) GetAllSettingView() (*entity.AllSettingView, error) {
+	allSetting, err := s.GetAllSetting()
+	if err != nil {
+		return nil, err
+	}
+	view := &entity.AllSettingView{AllSetting: *allSetting}
+	view.HasTgBotToken = secretConfigured(allSetting.TgBotToken)
+	view.HasTwoFactorToken = secretConfigured(allSetting.TwoFactorToken)
+	view.HasLdapPassword = secretConfigured(allSetting.LdapPassword)
+	view.HasWarpSecret = secretConfigured(mustString(s.GetWarp()))
+	view.HasNordSecret = secretConfigured(mustString(s.GetNord()))
+	var apiTokenCount int64
+	if err := database.GetDB().Model(model.ApiToken{}).Where("enabled = ?", true).Count(&apiTokenCount).Error; err == nil {
+		view.HasApiToken = apiTokenCount > 0
+	}
+	view.TgBotToken = ""
+	view.TwoFactorToken = ""
+	view.LdapPassword = ""
+	return view, nil
+}
+
+func secretConfigured(value string) bool {
+	return strings.TrimSpace(value) != ""
+}
+
+func mustString(value string, _ error) string {
+	return value
+}
+
 func (s *SettingService) ResetSettings() error {
 	db := database.GetDB()
 	err := db.Where("1 = 1").Delete(model.Setting{}).Error
@@ -283,7 +319,11 @@ func (s *SettingService) GetXrayOutboundTestUrl() (string, error) {
 }
 
 func (s *SettingService) SetXrayOutboundTestUrl(url string) error {
-	return s.setString("xrayOutboundTestUrl", url)
+	clean, err := SanitizeHTTPURL(url)
+	if err != nil {
+		return err
+	}
+	return s.setString("xrayOutboundTestUrl", clean)
 }
 
 func (s *SettingService) GetListen() (string, error) {
@@ -312,6 +352,31 @@ func (s *SettingService) GetTgBotProxy() (string, error) {
 
 func (s *SettingService) SetTgBotProxy(token string) error {
 	return s.setString("tgBotProxy", token)
+}
+
+func (s *SettingService) GetPanelProxy() (string, error) {
+	return s.getString("panelProxy")
+}
+
+func (s *SettingService) SetPanelProxy(proxyUrl string) error {
+	return s.setString("panelProxy", proxyUrl)
+}
+
+// NewProxiedHTTPClient returns an HTTP client that routes the panel's own
+// outbound requests through the configured panelProxy setting. An invalid or
+// missing proxy falls back to a direct client so existing behavior is preserved.
+func (s *SettingService) NewProxiedHTTPClient(timeout time.Duration) *http.Client {
+	proxyUrl, err := s.GetPanelProxy()
+	if err != nil {
+		logger.Warning("Failed to read panel proxy setting:", err)
+		proxyUrl = ""
+	}
+	client, err := netproxy.NewHTTPClient(proxyUrl, timeout)
+	if err != nil {
+		logger.Warningf("Invalid panel proxy %q, using direct connection: %v", proxyUrl, err)
+		return &http.Client{Timeout: timeout}
+	}
+	return client
 }
 
 func (s *SettingService) GetTgBotAPIServer() (string, error) {
@@ -414,6 +479,10 @@ func (s *SettingService) GetSessionMaxAge() (int, error) {
 	return s.getInt("sessionMaxAge")
 }
 
+func (s *SettingService) GetTrustedProxyCIDRs() (string, error) {
+	return s.getString("trustedProxyCIDRs")
+}
+
 func (s *SettingService) GetRemarkModel() (string, error) {
 	return s.getString("remarkModel")
 }
@@ -462,7 +531,12 @@ func (s *SettingService) GetTimeLocation() (*time.Location, error) {
 	if err != nil {
 		defaultLocation := defaultValueMap["timeLocation"]
 		logger.Errorf("location <%v> not exist, using default location: %v", l, defaultLocation)
-		return time.LoadLocation(defaultLocation)
+		location, err = time.LoadLocation(defaultLocation)
+		if err != nil {
+			logger.Errorf("failed to load default location, using UTC: %v", err)
+			return time.UTC, nil
+		}
+		return location, nil
 	}
 	return location, nil
 }
@@ -547,6 +621,10 @@ func (s *SettingService) GetSubShowInfo() (bool, error) {
 	return s.getBool("subShowInfo")
 }
 
+func (s *SettingService) GetSubEmailInRemark() (bool, error) {
+	return s.getBool("subEmailInRemark")
+}
+
 func (s *SettingService) GetPageSize() (int, error) {
 	return s.getInt("pageSize")
 }
@@ -621,6 +699,14 @@ func (s *SettingService) GetExternalTrafficInformURI() (string, error) {
 
 func (s *SettingService) SetExternalTrafficInformURI(InformURI string) error {
 	return s.setString("externalTrafficInformURI", InformURI)
+}
+
+func (s *SettingService) GetRestartXrayOnClientDisable() (bool, error) {
+	return s.getBool("restartXrayOnClientDisable")
+}
+
+func (s *SettingService) SetRestartXrayOnClientDisable(value bool) error {
+	return s.setBool("restartXrayOnClientDisable", value)
 }
 
 func (s *SettingService) GetIpLimitEnable() (bool, error) {
@@ -713,6 +799,12 @@ func (s *SettingService) GetLdapDefaultLimitIP() (int, error) {
 }
 
 func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
+	if err := s.preserveRedactedSecrets(allSetting); err != nil {
+		return err
+	}
+	if err := validateSettingsURLs(allSetting); err != nil {
+		return err
+	}
 	if err := allSetting.CheckValid(); err != nil {
 		return err
 	}
@@ -731,6 +823,58 @@ func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
 		}
 	}
 	return common.Combine(errs...)
+}
+
+func (s *SettingService) preserveRedactedSecrets(allSetting *entity.AllSetting) error {
+	if strings.TrimSpace(allSetting.TgBotToken) == "" {
+		value, err := s.GetTgBotToken()
+		if err != nil {
+			return err
+		}
+		allSetting.TgBotToken = value
+	}
+	if strings.TrimSpace(allSetting.LdapPassword) == "" {
+		value, err := s.GetLdapPassword()
+		if err != nil {
+			return err
+		}
+		allSetting.LdapPassword = value
+	}
+	if allSetting.TwoFactorEnable && strings.TrimSpace(allSetting.TwoFactorToken) == "" {
+		value, err := s.GetTwoFactorToken()
+		if err != nil {
+			return err
+		}
+		allSetting.TwoFactorToken = value
+	}
+	return nil
+}
+
+func validateSettingsURLs(allSetting *entity.AllSetting) error {
+	if allSetting.ExternalTrafficInformURI != "" {
+		u, err := SanitizeHTTPURL(allSetting.ExternalTrafficInformURI)
+		if err != nil {
+			return common.NewError("external traffic inform URI is invalid:", err)
+		}
+		allSetting.ExternalTrafficInformURI = u
+	}
+	if allSetting.TgBotAPIServer != "" {
+		u, err := SanitizeHTTPURL(allSetting.TgBotAPIServer)
+		if err != nil {
+			return common.NewError("telegram API server URL is invalid:", err)
+		}
+		allSetting.TgBotAPIServer = u
+	}
+	return nil
+}
+
+func (s *SettingService) UpdateSecret(key string, value string) error {
+	switch key {
+	case "tgBotToken", "ldapPassword", "twoFactorToken":
+		return s.saveSetting(key, strings.TrimSpace(value))
+	default:
+		return common.NewError("secret key is not replaceable:", key)
+	}
 }
 
 func (s *SettingService) GetDefaultXrayConfig() (any, error) {
